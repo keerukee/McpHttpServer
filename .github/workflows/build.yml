@@ -32,8 +32,10 @@ jobs:
       
       - name: Pack
         run: dotnet pack -c Release --no-build --output ./nupkg
+        
+      - name: NuGet login
+        uses: NuGet/login@v1
+        id: login
       
       - name: Push to NuGet
-        # With Trusted Publishing, we completely remove the --api-key argument! 
-        # dotnet natively handles the OIDC token exchange automatically.
-        run: dotnet nuget push ./nupkg/*.nupkg --source https://api.nuget.org/v3/index.json --skip-duplicate
+        run: dotnet nuget push ./nupkg/*.nupkg --api-key ${{ steps.login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
