@@ -8,6 +8,7 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    environment: production
     
     # Required for NuGet Trusted Publishing (OIDC)
     permissions:
