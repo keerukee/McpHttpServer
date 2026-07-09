@@ -1,0 +1,18 @@
+# Visual Studio / .NET
+bin/
+obj/
+.vs/
+*.user
+*.suo
+
+# Mac
+.DS_Store
+
+# Exclude Test and Sample Projects from Git
+McpHttpServer.Sample/
+McpHttpServer.Tests/
+
+# Note: The .sln file is still checked in, but users cloning the repo 
+# may see missing project warnings for the sample and test projects.
+
+*.Local.sln
