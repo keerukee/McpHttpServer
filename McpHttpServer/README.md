@@ -84,4 +84,4 @@ That's it! The library will auto-discover `MyAiTools` on startup, build the requ
 You can easily test your server using the official MCP Inspector.
 1. Run your .NET application.
 2. Launch the inspector: `npx @modelcontextprotocol/inspector`
-3. Select **SSE** transport and connect to `http://localhost:<port>/mcp`.
+3. Select **HTTP** transport and connect to `http://localhost:<port>/mcp`.
