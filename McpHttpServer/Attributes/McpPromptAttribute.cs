@@ -9,6 +9,9 @@ public class McpPromptAttribute : Attribute
 {
     public string Name { get; }
     public string Description { get; }
+    public string? Title { get; set; }
+    public string? IconSrc { get; set; }
+    public string? IconMimeType { get; set; }
 
     public McpPromptAttribute(string name, string description)
     {

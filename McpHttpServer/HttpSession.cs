@@ -10,11 +10,18 @@ public class HttpSession : IDisposable
 {
     private readonly HttpResponse _response;
     private readonly SemaphoreSlim _lock = new(1, 1);
+    private long _eventCounter;
     private bool _isDisposed;
 
-    public HttpSession(HttpResponse response) => _response = response;
+    public string? LastEventId { get; init; }
 
-    public async Task SendEventAsync(string eventType, string data)
+    public HttpSession(HttpResponse response, string? lastEventId = null)
+    {
+        _response = response;
+        LastEventId = lastEventId;
+    }
+
+    public async Task SendEventAsync(string eventType, string data, string? id = null)
     {
         if (_isDisposed) throw new ObjectDisposedException(nameof(HttpSession));
 
@@ -23,7 +30,8 @@ public class HttpSession : IDisposable
         {
             if (_isDisposed) throw new ObjectDisposedException(nameof(HttpSession));
 
-            var message = $"event: {eventType}\ndata: {data}\n\n";
+            var eventId = id ?? Interlocked.Increment(ref _eventCounter).ToString();
+            var message = $"id: {eventId}\nevent: {eventType}\ndata: {data}\n\n";
             await _response.WriteAsync(message);
             await _response.Body.FlushAsync();
         }

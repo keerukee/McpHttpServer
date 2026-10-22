@@ -7,9 +7,9 @@
     
     <!-- NuGet Package Properties -->
     <PackageId>McpHttpServer</PackageId>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <Authors>Keerthi RB</Authors>
-    <Description>A plug-and-play .NET library for hosting Model Context Protocol (MCP) servers using the Streamable HTTP transport.</Description>
+    <Description>A plug-and-play .NET library for hosting Model Context Protocol (MCP) servers using the Streamable HTTP transport (supports 2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25, and 2026-07-28 specifications, Devin, Claude, and MCP Inspector).</Description>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <RepositoryUrl>https://github.com/keerukee/McpHttpServer</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
