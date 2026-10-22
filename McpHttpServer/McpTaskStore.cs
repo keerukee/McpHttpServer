@@ -8,6 +8,9 @@ namespace McpHttpServer;
 /// </summary>
 public class McpTask
 {
+    [JsonPropertyName("resultType")]
+    public string ResultType { get; init; } = "complete";
+
     [JsonPropertyName("taskId")]
     public required string TaskId { get; init; }
 
@@ -31,9 +34,17 @@ public class McpTask
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? Ttl { get; set; }
 
+    [JsonPropertyName("ttlMs")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? TtlMs => Ttl;
+
     [JsonPropertyName("pollInterval")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? PollInterval { get; set; }
+
+    [JsonPropertyName("pollIntervalMs")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? PollIntervalMs => PollInterval;
 
     [JsonPropertyName("result")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]

@@ -64,6 +64,8 @@ public class McpRequestProcessor
                         bodyName = n.GetString();
                     else if (p.TryGetProperty("uri", out var u))
                         bodyName = u.GetString();
+                    else if (p.TryGetProperty("taskId", out var t))
+                        bodyName = t.GetString();
                 }
 
                 if (!string.Equals(bodyName, mcpNameHeader, StringComparison.Ordinal))
@@ -323,32 +325,18 @@ public class McpRequestProcessor
 
     private object HandleServerDiscover(JsonElement paramsElement)
     {
-        string negotiatedVersion = _options.ProtocolVersion;
-        if (paramsElement.ValueKind == JsonValueKind.Object &&
-            paramsElement.TryGetProperty("_meta", out var metaEl) &&
-            metaEl.ValueKind == JsonValueKind.Object &&
-            metaEl.TryGetProperty("io.modelcontextprotocol/protocolVersion", out var metaVersionEl))
-        {
-            var clientVersion = metaVersionEl.GetString();
-            if (!string.IsNullOrEmpty(clientVersion) && _options.SupportedProtocolVersions.Contains(clientVersion))
-            {
-                negotiatedVersion = clientVersion;
-            }
-        }
-
         var serverInfo = BuildServerInfo();
         var response = new Dictionary<string, object>
         {
-            ["protocolVersion"] = negotiatedVersion,
+            ["resultType"] = "complete",
             ["supportedVersions"] = _options.SupportedProtocolVersions.ToArray(),
             ["capabilities"] = BuildServerCapabilities(includeExtensions: true),
-            ["serverInfo"] = serverInfo,
+            ["ttlMs"] = _options.ListCacheTtlMs ?? 60000,
+            ["cacheScope"] = _options.CacheScope,
             ["_meta"] = new Dictionary<string, object>
             {
                 ["io.modelcontextprotocol/serverInfo"] = serverInfo
-            },
-            ["ttlMs"] = _options.ListCacheTtlMs ?? 60000,
-            ["cacheScope"] = _options.CacheScope
+            }
         };
 
         if (!string.IsNullOrEmpty(_options.Instructions))
@@ -446,7 +434,20 @@ public class McpRequestProcessor
                 }
             });
 
-            return new { task = mcpTask };
+            return new
+            {
+                resultType = "task",
+                taskId = mcpTask.TaskId,
+                status = mcpTask.Status,
+                statusMessage = mcpTask.StatusMessage,
+                createdAt = mcpTask.CreatedAt,
+                lastUpdatedAt = mcpTask.LastUpdatedAt,
+                ttl = mcpTask.Ttl,
+                ttlMs = mcpTask.TtlMs,
+                pollInterval = mcpTask.PollInterval,
+                pollIntervalMs = mcpTask.PollIntervalMs,
+                task = mcpTask
+            };
         }
 
         return await ExecuteToolFormattedAsync(toolName, args, cancellationToken);
@@ -459,6 +460,8 @@ public class McpRequestProcessor
         {
             if (taskEl.TryGetProperty("ttl", out var ttlEl) && ttlEl.ValueKind == JsonValueKind.Number)
                 ttl = ttlEl.GetInt32();
+            else if (taskEl.TryGetProperty("ttlMs", out var ttlMsEl) && ttlMsEl.ValueKind == JsonValueKind.Number)
+                ttl = ttlMsEl.GetInt32();
             return true;
         }
 
@@ -466,11 +469,12 @@ public class McpRequestProcessor
             metaEl.ValueKind == JsonValueKind.Object &&
             metaEl.TryGetProperty("io.modelcontextprotocol/tasks", out var metaTaskEl))
         {
-            if (metaTaskEl.ValueKind == JsonValueKind.Object &&
-                metaTaskEl.TryGetProperty("ttl", out var ttlEl) &&
-                ttlEl.ValueKind == JsonValueKind.Number)
+            if (metaTaskEl.ValueKind == JsonValueKind.Object)
             {
-                ttl = ttlEl.GetInt32();
+                if (metaTaskEl.TryGetProperty("ttl", out var ttlEl) && ttlEl.ValueKind == JsonValueKind.Number)
+                    ttl = ttlEl.GetInt32();
+                else if (metaTaskEl.TryGetProperty("ttlMs", out var ttlMsEl) && ttlMsEl.ValueKind == JsonValueKind.Number)
+                    ttl = ttlMsEl.GetInt32();
             }
             return metaTaskEl.ValueKind == JsonValueKind.Object || metaTaskEl.ValueKind == JsonValueKind.True;
         }

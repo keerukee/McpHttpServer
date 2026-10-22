@@ -14,7 +14,7 @@ public class McpServerOptions
     /// <summary>
     /// The version of the MCP server.
     /// </summary>
-    public string ServerVersion { get; set; } = "1.1.1";
+    public string ServerVersion { get; set; } = "1.1.3";
 
     /// <summary>
     /// Optional human-readable title of the MCP server implementation (MCP SEP-973).
