@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Microsoft.AspNetCore.Http;
 
 namespace McpHttpServer;
 
@@ -11,14 +12,20 @@ public class McpRequestProcessor
     private readonly McpRegistry _registry;
     private readonly McpServerOptions _options;
     private readonly McpTaskStore _taskStore;
+    private readonly IHttpContextAccessor? _httpContextAccessor;
 
     public McpTaskStore TaskStore => _taskStore;
 
-    public McpRequestProcessor(McpRegistry registry, McpServerOptions options, McpTaskStore? taskStore = null)
+    public McpRequestProcessor(
+        McpRegistry registry,
+        McpServerOptions options,
+        McpTaskStore? taskStore = null,
+        IHttpContextAccessor? httpContextAccessor = null)
     {
         _registry = registry;
         _options = options;
         _taskStore = taskStore ?? new McpTaskStore();
+        _httpContextAccessor = httpContextAccessor;
     }
 
     /// <summary>
@@ -288,12 +295,12 @@ public class McpRequestProcessor
             info["websiteUrl"] = _options.WebsiteUrl!;
 
         if (_options.Icons.Count > 0)
-            info["icons"] = _options.Icons;
+            info["icons"] = McpIcon.ResolveIcons(_options.Icons, _httpContextAccessor?.HttpContext);
 
         return info;
     }
 
-    private Dictionary<string, object> BuildServerCapabilities()
+    private Dictionary<string, object> BuildServerCapabilities(bool includeExtensions)
     {
         var capabilities = new Dictionary<string, object>
         {
@@ -303,7 +310,7 @@ public class McpRequestProcessor
             ["logging"] = new { }
         };
 
-        if (_options.EnableTasksExtension)
+        if (includeExtensions && _options.EnableTasksExtension)
         {
             capabilities["extensions"] = new Dictionary<string, object>
             {
@@ -316,13 +323,29 @@ public class McpRequestProcessor
 
     private object HandleServerDiscover(JsonElement paramsElement)
     {
+        string negotiatedVersion = _options.ProtocolVersion;
+        if (paramsElement.ValueKind == JsonValueKind.Object &&
+            paramsElement.TryGetProperty("_meta", out var metaEl) &&
+            metaEl.ValueKind == JsonValueKind.Object &&
+            metaEl.TryGetProperty("io.modelcontextprotocol/protocolVersion", out var metaVersionEl))
+        {
+            var clientVersion = metaVersionEl.GetString();
+            if (!string.IsNullOrEmpty(clientVersion) && _options.SupportedProtocolVersions.Contains(clientVersion))
+            {
+                negotiatedVersion = clientVersion;
+            }
+        }
+
+        var serverInfo = BuildServerInfo();
         var response = new Dictionary<string, object>
         {
+            ["protocolVersion"] = negotiatedVersion,
             ["supportedVersions"] = _options.SupportedProtocolVersions.ToArray(),
-            ["capabilities"] = BuildServerCapabilities(),
+            ["capabilities"] = BuildServerCapabilities(includeExtensions: true),
+            ["serverInfo"] = serverInfo,
             ["_meta"] = new Dictionary<string, object>
             {
-                ["io.modelcontextprotocol/serverInfo"] = BuildServerInfo()
+                ["io.modelcontextprotocol/serverInfo"] = serverInfo
             },
             ["ttlMs"] = _options.ListCacheTtlMs ?? 60000,
             ["cacheScope"] = _options.CacheScope
@@ -369,10 +392,11 @@ public class McpRequestProcessor
             }
         }
 
+        bool is2026 = string.Equals(negotiatedVersion, "2026-07-28", StringComparison.OrdinalIgnoreCase);
         var response = new Dictionary<string, object>
         {
             ["protocolVersion"] = negotiatedVersion,
-            ["capabilities"] = BuildServerCapabilities(),
+            ["capabilities"] = BuildServerCapabilities(includeExtensions: is2026),
             ["serverInfo"] = BuildServerInfo()
         };
 

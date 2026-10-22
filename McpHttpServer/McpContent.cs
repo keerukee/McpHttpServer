@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Http;
 
 namespace McpHttpServer;
 
@@ -138,6 +139,7 @@ public class McpIcon
 {
     /// <summary>
     /// Standard URI pointing to an icon resource (HTTP/HTTPS URL or data: URI).
+    /// Relative paths (e.g., "/icon.png") are automatically resolved against the active HTTP request base URL.
     /// </summary>
     [JsonPropertyName("src")]
     public required string Src { get; init; }
@@ -162,4 +164,40 @@ public class McpIcon
     [JsonPropertyName("theme")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Theme { get; init; }
+
+    /// <summary>
+    /// Resolves any relative icon Src paths (such as "/icon.png") to full URLs so strict MCP clients (like Devin Local) pass URL schema validation.
+    /// </summary>
+    internal static List<McpIcon> ResolveIcons(IEnumerable<McpIcon> icons, HttpContext? httpContext)
+    {
+        string baseUrl = "http://localhost";
+        if (httpContext?.Request != null && httpContext.Request.Host.HasValue)
+        {
+            var scheme = string.IsNullOrEmpty(httpContext.Request.Scheme) ? "http" : httpContext.Request.Scheme;
+            baseUrl = $"{scheme}://{httpContext.Request.Host}";
+        }
+
+        var resolved = new List<McpIcon>();
+        foreach (var icon in icons)
+        {
+            var src = icon.Src;
+            if (!string.IsNullOrEmpty(src) &&
+                !src.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                !src.StartsWith("https://", StringComparison.OrdinalIgnoreCase) &&
+                !src.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+            {
+                src = src.StartsWith('/') ? $"{baseUrl}{src}" : $"{baseUrl}/{src}";
+            }
+
+            resolved.Add(new McpIcon
+            {
+                Src = src,
+                MimeType = icon.MimeType,
+                Sizes = icon.Sizes,
+                Theme = icon.Theme
+            });
+        }
+
+        return resolved;
+    }
 }

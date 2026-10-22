@@ -2,6 +2,7 @@ using System.Collections;
 using System.Reflection;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using McpHttpServer.Attributes;
 
@@ -711,7 +712,7 @@ public class McpRegistry
                 dict["outputSchema"] = t.OutputSchema;
 
             if (t.Icons != null && t.Icons.Count > 0)
-                dict["icons"] = t.Icons;
+                dict["icons"] = McpIcon.ResolveIcons(t.Icons, _serviceProvider.GetService<IHttpContextAccessor>()?.HttpContext);
 
             return dict;
         }).ToArray();
@@ -727,6 +728,7 @@ public class McpRegistry
     /// </summary>
     public object GetResourcesList(int? ttlMs = null, string cacheScope = "public")
     {
+        var httpContext = _serviceProvider.GetService<IHttpContextAccessor>()?.HttpContext;
         var resources = _resources.Values.Select(r =>
         {
             var dict = new Dictionary<string, object>
@@ -739,7 +741,7 @@ public class McpRegistry
             if (!string.IsNullOrEmpty(r.Title))
                 dict["title"] = r.Title!;
             if (r.Icons != null && r.Icons.Count > 0)
-                dict["icons"] = r.Icons;
+                dict["icons"] = McpIcon.ResolveIcons(r.Icons, httpContext);
             return dict;
         }).ToArray();
 
@@ -754,6 +756,7 @@ public class McpRegistry
     /// </summary>
     public object GetResourceTemplatesList(int? ttlMs = null, string cacheScope = "public")
     {
+        var httpContext = _serviceProvider.GetService<IHttpContextAccessor>()?.HttpContext;
         var resourceTemplates = _resourceTemplates.Values.Select(rt =>
         {
             var dict = new Dictionary<string, object>
@@ -766,7 +769,7 @@ public class McpRegistry
             if (!string.IsNullOrEmpty(rt.Title))
                 dict["title"] = rt.Title!;
             if (rt.Icons != null && rt.Icons.Count > 0)
-                dict["icons"] = rt.Icons;
+                dict["icons"] = McpIcon.ResolveIcons(rt.Icons, httpContext);
             return dict;
         }).ToArray();
 
@@ -781,6 +784,7 @@ public class McpRegistry
     /// </summary>
     public object GetPromptsList(int? ttlMs = null, string cacheScope = "public")
     {
+        var httpContext = _serviceProvider.GetService<IHttpContextAccessor>()?.HttpContext;
         var prompts = _prompts.Values.Select(p =>
         {
             var dict = new Dictionary<string, object>
@@ -799,7 +803,7 @@ public class McpRegistry
             if (!string.IsNullOrEmpty(p.Title))
                 dict["title"] = p.Title!;
             if (p.Icons != null && p.Icons.Count > 0)
-                dict["icons"] = p.Icons;
+                dict["icons"] = McpIcon.ResolveIcons(p.Icons, httpContext);
             return dict;
         }).ToArray();
 

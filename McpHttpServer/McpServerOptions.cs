@@ -14,7 +14,7 @@ public class McpServerOptions
     /// <summary>
     /// The version of the MCP server.
     /// </summary>
-    public string ServerVersion { get; set; } = "1.1.0";
+    public string ServerVersion { get; set; } = "1.1.1";
 
     /// <summary>
     /// Optional human-readable title of the MCP server implementation (MCP SEP-973).
@@ -28,13 +28,16 @@ public class McpServerOptions
 
     /// <summary>
     /// Optional icons representing this MCP server implementation (MCP SEP-973).
+    /// Relative paths like "/icon.png" are automatically resolved to absolute URLs using the incoming HTTP request host.
     /// </summary>
     public List<McpIcon> Icons { get; set; } = new();
 
     /// <summary>
     /// The default MCP protocol version to advertise when the client does not request a specific supported version.
+    /// Defaults to "2025-11-25" for out-of-the-box compatibility with Devin Local, Claude, and MCP Inspector,
+    /// while "2026-07-28" is negotiated automatically when requested.
     /// </summary>
-    public string ProtocolVersion { get; set; } = "2026-07-28";
+    public string ProtocolVersion { get; set; } = "2025-11-25";
 
     /// <summary>
     /// List of protocol versions supported by this server during version negotiation and header validation.
