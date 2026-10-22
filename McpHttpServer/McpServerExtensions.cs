@@ -305,6 +305,10 @@ public static class McpServerExtensions
             {
                 negotiatedVersion = bodyVersion!;
             }
+            else if (isInitialize && !McpRequestProcessor.HasInitializeHandshake(negotiatedVersion))
+            {
+                negotiatedVersion = McpRequestProcessor.NegotiateInitializeVersion(negotiatedVersion, options);
+            }
 
             ctx.Response.Headers["MCP-Protocol-Version"] = negotiatedVersion;
 
@@ -444,6 +448,9 @@ public static class McpServerExtensions
                 return false;
             }
 
+            bool isInitMethod = root.TryGetProperty("method", out var methodProp) &&
+                                string.Equals(methodProp.GetString(), "initialize", StringComparison.Ordinal);
+
             if (p.TryGetProperty("_meta", out var meta) &&
                 meta.ValueKind == JsonValueKind.Object &&
                 meta.TryGetProperty("io.modelcontextprotocol/protocolVersion", out var metaVer))
@@ -451,7 +458,7 @@ public static class McpServerExtensions
                 var v = metaVer.GetString();
                 if (!string.IsNullOrEmpty(v) && options.SupportedProtocolVersions.Contains(v))
                 {
-                    version = v;
+                    version = isInitMethod ? McpRequestProcessor.NegotiateInitializeVersion(v, options) : v;
                     return true;
                 }
             }
@@ -459,9 +466,9 @@ public static class McpServerExtensions
             if (p.TryGetProperty("protocolVersion", out var initVer))
             {
                 var v = initVer.GetString();
-                if (!string.IsNullOrEmpty(v) && options.SupportedProtocolVersions.Contains(v))
+                if (!string.IsNullOrEmpty(v))
                 {
-                    version = v;
+                    version = McpRequestProcessor.NegotiateInitializeVersion(v, options);
                     return true;
                 }
             }

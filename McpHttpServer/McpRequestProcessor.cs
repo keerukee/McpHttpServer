@@ -347,44 +347,72 @@ public class McpRequestProcessor
         return response;
     }
 
+    /// <summary>
+    /// First protocol version that replaced the 'initialize' handshake with per-request '_meta' (SEP-2567).
+    /// Per MCP 2026-07-28 and rmcp (ProtocolVersion::NO_INITIALIZE / LATEST_WITH_INITIALIZE),
+    /// 'initialize' only negotiates versions prior to 2026-07-28 (ceiling '2025-11-25'),
+    /// whereas 2026-07-28 uses 'server/discover' and stateless per-request '_meta'.
+    /// </summary>
+    internal const string NoInitializeVersion = "2026-07-28";
+
+    internal static bool HasInitializeHandshake(string version) =>
+        string.CompareOrdinal(version, NoInitializeVersion) < 0;
+
+    internal static string NegotiateInitializeVersion(string? clientVersion, McpServerOptions options)
+    {
+        if (!string.IsNullOrEmpty(clientVersion) &&
+            HasInitializeHandshake(clientVersion) &&
+            options.SupportedProtocolVersions.Contains(clientVersion))
+        {
+            return clientVersion;
+        }
+
+        if (HasInitializeHandshake(options.ProtocolVersion) &&
+            options.SupportedProtocolVersions.Contains(options.ProtocolVersion))
+        {
+            return options.ProtocolVersion;
+        }
+
+        return options.SupportedProtocolVersions
+            .Where(HasInitializeHandshake)
+            .OrderByDescending(v => v, StringComparer.Ordinal)
+            .FirstOrDefault() ?? "2025-11-25";
+    }
+
     private object HandleInitialize(JsonElement paramsElement)
     {
-        string negotiatedVersion = _options.ProtocolVersion;
+        string? requestedVersion = null;
 
         if (paramsElement.ValueKind == JsonValueKind.Object)
         {
             if (paramsElement.TryGetProperty("protocolVersion", out var clientVersionEl))
             {
-                var clientVersion = clientVersionEl.GetString();
-                if (!string.IsNullOrEmpty(clientVersion) && _options.SupportedProtocolVersions.Contains(clientVersion))
-                {
-                    negotiatedVersion = clientVersion;
-                }
+                requestedVersion = clientVersionEl.GetString();
             }
             else if (paramsElement.TryGetProperty("_meta", out var metaEl) &&
                      metaEl.ValueKind == JsonValueKind.Object &&
                      metaEl.TryGetProperty("io.modelcontextprotocol/protocolVersion", out var metaVersionEl))
             {
-                var clientVersion = metaVersionEl.GetString();
-                if (!string.IsNullOrEmpty(clientVersion) && _options.SupportedProtocolVersions.Contains(clientVersion))
-                {
-                    negotiatedVersion = clientVersion;
-                }
-            }
-
-            if (_options.EnableLogging && paramsElement.TryGetProperty("clientInfo", out var clientInfo) && clientInfo.ValueKind == JsonValueKind.Object)
-            {
-                var name = clientInfo.TryGetProperty("name", out var n) ? n.GetString() : "Unknown";
-                var version = clientInfo.TryGetProperty("version", out var v) ? v.GetString() : "Unknown";
-                Console.WriteLine($"[MCP] Client connected: {name} {version} (protocol: {negotiatedVersion})");
+                requestedVersion = metaVersionEl.GetString();
             }
         }
 
-        bool is2026 = string.Equals(negotiatedVersion, "2026-07-28", StringComparison.OrdinalIgnoreCase);
+        string negotiatedVersion = NegotiateInitializeVersion(requestedVersion, _options);
+
+        if (paramsElement.ValueKind == JsonValueKind.Object &&
+            _options.EnableLogging &&
+            paramsElement.TryGetProperty("clientInfo", out var clientInfo) &&
+            clientInfo.ValueKind == JsonValueKind.Object)
+        {
+            var name = clientInfo.TryGetProperty("name", out var n) ? n.GetString() : "Unknown";
+            var version = clientInfo.TryGetProperty("version", out var v) ? v.GetString() : "Unknown";
+            Console.WriteLine($"[MCP] Client connected: {name} {version} (protocol: {negotiatedVersion})");
+        }
+
         var response = new Dictionary<string, object>
         {
             ["protocolVersion"] = negotiatedVersion,
-            ["capabilities"] = BuildServerCapabilities(includeExtensions: is2026),
+            ["capabilities"] = BuildServerCapabilities(includeExtensions: false),
             ["serverInfo"] = BuildServerInfo()
         };
 
