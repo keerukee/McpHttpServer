@@ -202,16 +202,16 @@ public class McpRequestProcessor
                 "ping" => new { },
 
                 // Tools
-                "tools/list" => _registry.GetToolsList(_options.ListCacheTtlMs, _options.CacheScope),
+                "tools/list" => await _registry.GetToolsListAsync(_options.ListCacheTtlMs, _options.CacheScope),
                 "tools/call" => await HandleToolCallAsync(paramsElement, cancellationToken),
 
                 // Resources
-                "resources/list" => _registry.GetResourcesList(_options.ListCacheTtlMs, _options.CacheScope),
+                "resources/list" => await _registry.GetResourcesListAsync(_options.ListCacheTtlMs, _options.CacheScope),
                 "resources/read" => await HandleResourceReadAsync(paramsElement, cancellationToken),
-                "resources/templates/list" => _registry.GetResourceTemplatesList(_options.ListCacheTtlMs, _options.CacheScope),
+                "resources/templates/list" => await _registry.GetResourceTemplatesListAsync(_options.ListCacheTtlMs, _options.CacheScope),
 
                 // Prompts
-                "prompts/list" => _registry.GetPromptsList(_options.ListCacheTtlMs, _options.CacheScope),
+                "prompts/list" => await _registry.GetPromptsListAsync(_options.ListCacheTtlMs, _options.CacheScope),
                 "prompts/get" => await HandlePromptGetAsync(paramsElement, cancellationToken),
 
                 // Tasks extension (io.modelcontextprotocol/tasks - MCP 2026-07-28 / SEP-2663)
@@ -440,6 +440,15 @@ public class McpRequestProcessor
             throw McpException.InvalidParams($"Unknown tool: {toolName}");
         }
 
+        if (!await _registry.EvaluateAuthorizationAsync(toolRegistration.Authorizations).ConfigureAwait(false))
+        {
+            return new
+            {
+                content = new[] { new { type = "text", text = $"Unauthorized (-32001): Access denied to tool '{toolName}'." } },
+                isError = true
+            };
+        }
+
         // Check if client requested asynchronous task execution (io.modelcontextprotocol/tasks - SEP-2663)
         if (_options.EnableTasksExtension && IsAsyncTaskRequested(paramsElement, out var requestedTtl))
         {
@@ -544,6 +553,10 @@ public class McpRequestProcessor
 
             var textResult = rawResult?.ToString() ?? "";
             return new { content = new[] { new { type = "text", text = textResult } }, isError = false };
+        }
+        catch (McpUnauthorizedException ex)
+        {
+            return new { content = new[] { new { type = "text", text = $"Unauthorized ({ex.Code}): {ex.Message}" } }, isError = true };
         }
         catch (Exception ex)
         {

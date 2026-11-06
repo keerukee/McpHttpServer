@@ -1,5 +1,7 @@
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Reflection;
+using System.Security.Claims;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Http;
@@ -17,7 +19,9 @@ public class McpRegistry
     private readonly Dictionary<string, ResourceRegistration> _resources = new();
     private readonly Dictionary<string, ResourceTemplateRegistration> _resourceTemplates = new();
     private readonly Dictionary<string, PromptRegistration> _prompts = new();
+    private readonly ConcurrentDictionary<string, (bool Allowed, DateTimeOffset ExpiresAt)> _authTtlCache = new();
     private readonly IServiceProvider _serviceProvider;
+    private bool _hasAuthorizedItems;
 
     public IReadOnlyDictionary<string, ToolRegistration> Tools => _tools;
     public IReadOnlyDictionary<string, ResourceRegistration> Resources => _resources;
@@ -133,6 +137,7 @@ public class McpRegistry
         }
 
         var icons = ExtractIcons(method, toolAttr.IconSrc, toolAttr.IconMimeType);
+        var authorizations = ExtractAuthorizations(method, instance);
 
         _tools[toolAttr.Name] = new ToolRegistration
         {
@@ -145,10 +150,219 @@ public class McpRegistry
             Annotations = annotations,
             OutputSchema = outputSchema,
             UseStructuredOutput = toolAttr.UseStructuredOutput,
-            Icons = icons
+            Icons = icons,
+            Authorizations = authorizations
         };
 
         Console.WriteLine($"[MCP] Registered tool: {toolAttr.Name}");
+    }
+
+    private List<AuthorizationRegistration>? ExtractAuthorizations(MethodInfo method, object? handlerInstance)
+    {
+        var attrs = new List<McpAuthorizeAttribute>();
+
+        if (method.DeclaringType != null)
+        {
+            attrs.AddRange(method.DeclaringType.GetCustomAttributes<McpAuthorizeAttribute>(inherit: true));
+        }
+        attrs.AddRange(method.GetCustomAttributes<McpAuthorizeAttribute>(inherit: true));
+
+        if (attrs.Count == 0)
+            return null;
+
+        _hasAuthorizedItems = true;
+        var registrations = new List<AuthorizationRegistration>(attrs.Count);
+
+        foreach (var attr in attrs)
+        {
+            var targetType = attr.CallbackType ?? method.DeclaringType
+                ?? throw new InvalidOperationException($"Cannot determine declaring type for [McpAuthorize(\"{attr.CallbackMethodName}\")] on method '{method.Name}'.");
+
+            var callbackMethod = targetType.GetMethod(
+                attr.CallbackMethodName,
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+                ?? throw new InvalidOperationException(
+                    $"Authorization callback method '{attr.CallbackMethodName}' not found on type '{targetType.FullName}' for handler '{method.Name}'.");
+
+            object? callbackTarget = null;
+            if (!callbackMethod.IsStatic)
+            {
+                if (handlerInstance != null && targetType.IsAssignableFrom(handlerInstance.GetType()))
+                {
+                    callbackTarget = handlerInstance;
+                }
+                else
+                {
+                    callbackTarget = ActivatorUtilities.GetServiceOrCreateInstance(_serviceProvider, targetType);
+                }
+            }
+
+            var compiled = CompileAuthCallback(callbackMethod, callbackTarget);
+            registrations.Add(new AuthorizationRegistration
+            {
+                CacheKey = $"{targetType.FullName}.{callbackMethod.Name}",
+                CompiledCallback = compiled,
+                CacheDurationSeconds = attr.CacheDurationSeconds
+            });
+        }
+
+        return registrations;
+    }
+
+    private static Func<HttpContext?, ValueTask<bool>> CompileAuthCallback(MethodInfo callbackMethod, object? target)
+    {
+        var parameters = callbackMethod.GetParameters();
+        var returnType = callbackMethod.ReturnType;
+
+        if (parameters.Length == 0)
+        {
+            if (returnType == typeof(bool))
+            {
+                var del = callbackMethod.CreateDelegate<Func<bool>>(target);
+                return _ => new ValueTask<bool>(del());
+            }
+            if (returnType == typeof(Task<bool>))
+            {
+                var del = callbackMethod.CreateDelegate<Func<Task<bool>>>(target);
+                return _ => new ValueTask<bool>(del());
+            }
+            if (returnType == typeof(ValueTask<bool>))
+            {
+                var del = callbackMethod.CreateDelegate<Func<ValueTask<bool>>>(target);
+                return _ => del();
+            }
+        }
+        else if (parameters.Length == 1 && parameters[0].ParameterType == typeof(HttpContext))
+        {
+            if (returnType == typeof(bool))
+            {
+                var del = callbackMethod.CreateDelegate<Func<HttpContext?, bool>>(target);
+                return ctx => new ValueTask<bool>(del(ctx));
+            }
+            if (returnType == typeof(Task<bool>))
+            {
+                var del = callbackMethod.CreateDelegate<Func<HttpContext?, Task<bool>>>(target);
+                return ctx => new ValueTask<bool>(del(ctx));
+            }
+            if (returnType == typeof(ValueTask<bool>))
+            {
+                var del = callbackMethod.CreateDelegate<Func<HttpContext?, ValueTask<bool>>>(target);
+                return ctx => del(ctx);
+            }
+        }
+        else if (parameters.Length == 1 && parameters[0].ParameterType == typeof(ClaimsPrincipal))
+        {
+            if (returnType == typeof(bool))
+            {
+                var del = callbackMethod.CreateDelegate<Func<ClaimsPrincipal?, bool>>(target);
+                return ctx => new ValueTask<bool>(del(ctx?.User));
+            }
+            if (returnType == typeof(Task<bool>))
+            {
+                var del = callbackMethod.CreateDelegate<Func<ClaimsPrincipal?, Task<bool>>>(target);
+                return ctx => new ValueTask<bool>(del(ctx?.User));
+            }
+            if (returnType == typeof(ValueTask<bool>))
+            {
+                var del = callbackMethod.CreateDelegate<Func<ClaimsPrincipal?, ValueTask<bool>>>(target);
+                return ctx => del(ctx?.User);
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"Unsupported signature for authorization callback '{callbackMethod.DeclaringType?.FullName}.{callbackMethod.Name}'. " +
+            "Supported parameters: (), (HttpContext), or (ClaimsPrincipal). Supported return types: bool, Task<bool>, or ValueTask<bool>.");
+    }
+
+    internal async ValueTask<bool> EvaluateAuthorizationAsync(List<AuthorizationRegistration>? authorizations)
+    {
+        if (authorizations == null || authorizations.Count == 0)
+            return true;
+
+        var httpContext = _serviceProvider.GetService<IHttpContextAccessor>()?.HttpContext;
+
+        foreach (var auth in authorizations)
+        {
+            var requestItemKey = "__McpAuth_" + auth.CacheKey;
+
+            // 1. Per-request deduplication via HttpContext.Items
+            if (httpContext?.Items != null &&
+                httpContext.Items.TryGetValue(requestItemKey, out var cachedInRequestObj) &&
+                cachedInRequestObj is bool cachedInRequest)
+            {
+                if (!cachedInRequest)
+                    return false;
+                continue;
+            }
+
+            // 2. Optional per-user/session TTL cache across HTTP requests
+            string? ttlCacheKey = null;
+            if (auth.CacheDurationSeconds > 0)
+            {
+                var callerKey = GetCallerCacheKey(httpContext);
+                ttlCacheKey = $"{auth.CacheKey}::{callerKey}";
+                if (_authTtlCache.TryGetValue(ttlCacheKey, out var ttlEntry))
+                {
+                    if (ttlEntry.ExpiresAt > DateTimeOffset.UtcNow)
+                    {
+                        if (httpContext?.Items != null)
+                            httpContext.Items[requestItemKey] = ttlEntry.Allowed;
+
+                        if (!ttlEntry.Allowed)
+                            return false;
+                        continue;
+                    }
+                    _authTtlCache.TryRemove(ttlCacheKey, out _);
+                }
+            }
+
+            // 3. Execute compiled delegate (zero reflection overhead)
+            bool allowed = await auth.CompiledCallback(httpContext).ConfigureAwait(false);
+
+            if (httpContext?.Items != null)
+                httpContext.Items[requestItemKey] = allowed;
+
+            if (ttlCacheKey != null && auth.CacheDurationSeconds > 0)
+            {
+                _authTtlCache[ttlCacheKey] = (allowed, DateTimeOffset.UtcNow.AddSeconds(auth.CacheDurationSeconds));
+            }
+
+            if (!allowed)
+                return false;
+        }
+
+        return true;
+    }
+
+    private static string GetCallerCacheKey(HttpContext? httpContext)
+    {
+        if (httpContext == null)
+            return "no-http-context";
+
+        var identityName = httpContext.User?.Identity?.Name;
+        if (!string.IsNullOrEmpty(identityName))
+            return $"user:{identityName}";
+
+        var subClaim = httpContext.User?.FindFirst(ClaimTypes.NameIdentifier)?.Value
+                    ?? httpContext.User?.FindFirst("sub")?.Value
+                    ?? httpContext.User?.FindFirst("oid")?.Value;
+        if (!string.IsNullOrEmpty(subClaim))
+            return $"claim:{subClaim}";
+
+        if (httpContext.Request.Headers.TryGetValue("Authorization", out var authHeader) && !string.IsNullOrEmpty(authHeader))
+            return $"auth:{authHeader.ToString().GetHashCode():X8}";
+
+        if (httpContext.Request.Headers.TryGetValue("Mcp-Session-Id", out var sessionId) && !string.IsNullOrEmpty(sessionId))
+            return $"session:{sessionId}";
+
+        // Support custom identity/group headers used in enterprise proxies or tests
+        foreach (var header in httpContext.Request.Headers)
+        {
+            if (header.Key.StartsWith("X-", StringComparison.OrdinalIgnoreCase))
+                return $"hdr:{header.Key}={header.Value}";
+        }
+
+        return "anonymous";
     }
 
     private static List<McpIcon>? ExtractIcons(MethodInfo method, string? primaryIconSrc, string? primaryIconMimeType)
@@ -203,7 +417,8 @@ public class McpRegistry
             MimeType = resourceAttr.MimeType,
             Icons = ExtractIcons(method, resourceAttr.IconSrc, resourceAttr.IconMimeType),
             Method = method,
-            Instance = method.IsStatic ? null : instance
+            Instance = method.IsStatic ? null : instance,
+            Authorizations = ExtractAuthorizations(method, instance)
         };
 
         Console.WriteLine($"[MCP] Registered resource: {resourceAttr.Uri}");
@@ -261,7 +476,8 @@ public class McpRegistry
             Parameters = parameters,
             RegexPattern = BuildUriTemplateRegex(uriTemplate),
             Method = method,
-            Instance = method.IsStatic ? null : instance
+            Instance = method.IsStatic ? null : instance,
+            Authorizations = ExtractAuthorizations(method, instance)
         };
 
         Console.WriteLine($"[MCP] Registered resource template: {uriTemplate}");
@@ -299,7 +515,8 @@ public class McpRegistry
             Icons = ExtractIcons(method, promptAttr.IconSrc, promptAttr.IconMimeType),
             Arguments = arguments,
             Method = method,
-            Instance = method.IsStatic ? null : instance
+            Instance = method.IsStatic ? null : instance,
+            Authorizations = ExtractAuthorizations(method, instance)
         };
 
         Console.WriteLine($"[MCP] Registered prompt: {promptAttr.Name}");
@@ -334,6 +551,9 @@ public class McpRegistry
         if (!_tools.TryGetValue(name, out var tool))
             throw McpException.InvalidParams($"Unknown tool: {name}");
 
+        if (!await EvaluateAuthorizationAsync(tool.Authorizations).ConfigureAwait(false))
+            throw McpException.Unauthorized($"Unauthorized: Access denied to tool '{name}'.");
+
         try
         {
             var args = BuildMethodArguments(tool.Parameters, arguments, cancellationToken);
@@ -361,6 +581,9 @@ public class McpRegistry
     {
         if (_resources.TryGetValue(uri, out var resource))
         {
+            if (!await EvaluateAuthorizationAsync(resource.Authorizations).ConfigureAwait(false))
+                throw McpException.Unauthorized($"Unauthorized: Access denied to resource '{uri}'.");
+
             try
             {
                 var parameters = resource.Method.GetParameters();
@@ -387,6 +610,9 @@ public class McpRegistry
             var match = template.RegexPattern.Match(uri);
             if (match.Success)
             {
+                if (!await EvaluateAuthorizationAsync(template.Authorizations).ConfigureAwait(false))
+                    throw McpException.Unauthorized($"Unauthorized: Access denied to resource '{uri}'.");
+
                 try
                 {
                     var args = new object?[template.Parameters.Count];
@@ -442,6 +668,9 @@ public class McpRegistry
     {
         if (!_prompts.TryGetValue(name, out var prompt))
             throw McpException.InvalidParams($"Unknown prompt: {name}");
+
+        if (!await EvaluateAuthorizationAsync(prompt.Authorizations).ConfigureAwait(false))
+            throw McpException.Unauthorized($"Unauthorized: Access denied to prompt '{name}'.");
 
         try
         {
@@ -676,12 +905,26 @@ public class McpRegistry
     }
 
     /// <summary>
-    /// Generates the tools/list response, supporting optional Title, ToolAnnotations (2025-03-26+), outputSchema (2025-06-18+), icons (SEP-973), and ttlMs/cacheScope (2026-07-28).
+    /// Generates the tools/list response, filtering out tools denied by [McpAuthorize] callbacks.
     /// </summary>
     public object GetToolsList(int? ttlMs = null, string cacheScope = "public")
     {
-        var tools = _tools.Values.Select(t =>
+        return GetToolsListAsync(ttlMs, cacheScope).GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// Asynchronously generates the tools/list response, filtering out tools denied by [McpAuthorize] callbacks.
+    /// </summary>
+    public async Task<object> GetToolsListAsync(int? ttlMs = null, string cacheScope = "public")
+    {
+        var httpContext = _serviceProvider.GetService<IHttpContextAccessor>()?.HttpContext;
+        var tools = new List<Dictionary<string, object>>();
+
+        foreach (var t in _tools.Values)
         {
+            if (!await EvaluateAuthorizationAsync(t.Authorizations).ConfigureAwait(false))
+                continue;
+
             var dict = new Dictionary<string, object>
             {
                 ["name"] = t.Name,
@@ -712,25 +955,39 @@ public class McpRegistry
                 dict["outputSchema"] = t.OutputSchema;
 
             if (t.Icons != null && t.Icons.Count > 0)
-                dict["icons"] = McpIcon.ResolveIcons(t.Icons, _serviceProvider.GetService<IHttpContextAccessor>()?.HttpContext);
+                dict["icons"] = McpIcon.ResolveIcons(t.Icons, httpContext);
 
-            return dict;
-        }).ToArray();
+            tools.Add(dict);
+        }
 
+        var effectiveCacheScope = _hasAuthorizedItems ? "private" : cacheScope;
         if (ttlMs.HasValue)
-            return new { tools, ttlMs = ttlMs.Value, cacheScope };
+            return new { tools = tools.ToArray(), ttlMs = ttlMs.Value, cacheScope = effectiveCacheScope };
 
-        return new { tools };
+        return new { tools = tools.ToArray() };
     }
 
     /// <summary>
-    /// Generates the resources/list response.
+    /// Generates the resources/list response, filtering out resources denied by [McpAuthorize] callbacks.
     /// </summary>
     public object GetResourcesList(int? ttlMs = null, string cacheScope = "public")
     {
+        return GetResourcesListAsync(ttlMs, cacheScope).GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// Asynchronously generates the resources/list response, filtering out resources denied by [McpAuthorize] callbacks.
+    /// </summary>
+    public async Task<object> GetResourcesListAsync(int? ttlMs = null, string cacheScope = "public")
+    {
         var httpContext = _serviceProvider.GetService<IHttpContextAccessor>()?.HttpContext;
-        var resources = _resources.Values.Select(r =>
+        var resources = new List<Dictionary<string, object>>();
+
+        foreach (var r in _resources.Values)
         {
+            if (!await EvaluateAuthorizationAsync(r.Authorizations).ConfigureAwait(false))
+                continue;
+
             var dict = new Dictionary<string, object>
             {
                 ["uri"] = r.Uri,
@@ -742,23 +999,37 @@ public class McpRegistry
                 dict["title"] = r.Title!;
             if (r.Icons != null && r.Icons.Count > 0)
                 dict["icons"] = McpIcon.ResolveIcons(r.Icons, httpContext);
-            return dict;
-        }).ToArray();
+            resources.Add(dict);
+        }
 
+        var effectiveCacheScope = _hasAuthorizedItems ? "private" : cacheScope;
         if (ttlMs.HasValue)
-            return new { resources, ttlMs = ttlMs.Value, cacheScope };
+            return new { resources = resources.ToArray(), ttlMs = ttlMs.Value, cacheScope = effectiveCacheScope };
 
-        return new { resources };
+        return new { resources = resources.ToArray() };
     }
 
     /// <summary>
-    /// Generates the resources/templates/list response.
+    /// Generates the resources/templates/list response, filtering out resource templates denied by [McpAuthorize] callbacks.
     /// </summary>
     public object GetResourceTemplatesList(int? ttlMs = null, string cacheScope = "public")
     {
+        return GetResourceTemplatesListAsync(ttlMs, cacheScope).GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// Asynchronously generates the resources/templates/list response, filtering out resource templates denied by [McpAuthorize] callbacks.
+    /// </summary>
+    public async Task<object> GetResourceTemplatesListAsync(int? ttlMs = null, string cacheScope = "public")
+    {
         var httpContext = _serviceProvider.GetService<IHttpContextAccessor>()?.HttpContext;
-        var resourceTemplates = _resourceTemplates.Values.Select(rt =>
+        var resourceTemplates = new List<Dictionary<string, object>>();
+
+        foreach (var rt in _resourceTemplates.Values)
         {
+            if (!await EvaluateAuthorizationAsync(rt.Authorizations).ConfigureAwait(false))
+                continue;
+
             var dict = new Dictionary<string, object>
             {
                 ["uriTemplate"] = rt.UriTemplate,
@@ -770,23 +1041,37 @@ public class McpRegistry
                 dict["title"] = rt.Title!;
             if (rt.Icons != null && rt.Icons.Count > 0)
                 dict["icons"] = McpIcon.ResolveIcons(rt.Icons, httpContext);
-            return dict;
-        }).ToArray();
+            resourceTemplates.Add(dict);
+        }
 
+        var effectiveCacheScope = _hasAuthorizedItems ? "private" : cacheScope;
         if (ttlMs.HasValue)
-            return new { resourceTemplates, ttlMs = ttlMs.Value, cacheScope };
+            return new { resourceTemplates = resourceTemplates.ToArray(), ttlMs = ttlMs.Value, cacheScope = effectiveCacheScope };
 
-        return new { resourceTemplates };
+        return new { resourceTemplates = resourceTemplates.ToArray() };
     }
 
     /// <summary>
-    /// Generates the prompts/list response.
+    /// Generates the prompts/list response, filtering out prompts denied by [McpAuthorize] callbacks.
     /// </summary>
     public object GetPromptsList(int? ttlMs = null, string cacheScope = "public")
     {
+        return GetPromptsListAsync(ttlMs, cacheScope).GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// Asynchronously generates the prompts/list response, filtering out prompts denied by [McpAuthorize] callbacks.
+    /// </summary>
+    public async Task<object> GetPromptsListAsync(int? ttlMs = null, string cacheScope = "public")
+    {
         var httpContext = _serviceProvider.GetService<IHttpContextAccessor>()?.HttpContext;
-        var prompts = _prompts.Values.Select(p =>
+        var prompts = new List<Dictionary<string, object>>();
+
+        foreach (var p in _prompts.Values)
         {
+            if (!await EvaluateAuthorizationAsync(p.Authorizations).ConfigureAwait(false))
+                continue;
+
             var dict = new Dictionary<string, object>
             {
                 ["name"] = p.Name,
@@ -804,13 +1089,14 @@ public class McpRegistry
                 dict["title"] = p.Title!;
             if (p.Icons != null && p.Icons.Count > 0)
                 dict["icons"] = McpIcon.ResolveIcons(p.Icons, httpContext);
-            return dict;
-        }).ToArray();
+            prompts.Add(dict);
+        }
 
+        var effectiveCacheScope = _hasAuthorizedItems ? "private" : cacheScope;
         if (ttlMs.HasValue)
-            return new { prompts, ttlMs = ttlMs.Value, cacheScope };
+            return new { prompts = prompts.ToArray(), ttlMs = ttlMs.Value, cacheScope = effectiveCacheScope };
 
-        return new { prompts };
+        return new { prompts = prompts.ToArray() };
     }
 
     private static object CreatePropertySchema(ParameterRegistration param)
@@ -866,6 +1152,13 @@ public class McpRegistry
     }
 }
 
+public class AuthorizationRegistration
+{
+    public required string CacheKey { get; init; }
+    public required Func<HttpContext?, ValueTask<bool>> CompiledCallback { get; init; }
+    public int CacheDurationSeconds { get; init; }
+}
+
 public class ToolRegistration
 {
     public required string Name { get; init; }
@@ -878,6 +1171,7 @@ public class ToolRegistration
     public object? OutputSchema { get; init; }
     public bool UseStructuredOutput { get; init; }
     public List<McpIcon>? Icons { get; init; }
+    public List<AuthorizationRegistration>? Authorizations { get; init; }
 }
 
 public class ParameterRegistration
@@ -902,6 +1196,7 @@ public class ResourceRegistration
     public List<McpIcon>? Icons { get; init; }
     public required MethodInfo Method { get; init; }
     public object? Instance { get; init; }
+    public List<AuthorizationRegistration>? Authorizations { get; init; }
 }
 
 public class ResourceTemplateRegistration
@@ -916,6 +1211,7 @@ public class ResourceTemplateRegistration
     public required Regex RegexPattern { get; init; }
     public required MethodInfo Method { get; init; }
     public object? Instance { get; init; }
+    public List<AuthorizationRegistration>? Authorizations { get; init; }
 }
 
 public class PromptRegistration
@@ -927,6 +1223,7 @@ public class PromptRegistration
     public required List<ArgumentRegistration> Arguments { get; init; }
     public required MethodInfo Method { get; init; }
     public object? Instance { get; init; }
+    public List<AuthorizationRegistration>? Authorizations { get; init; }
 }
 
 public class ArgumentRegistration
